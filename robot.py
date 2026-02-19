@@ -61,11 +61,11 @@ class Robot:
         self.num_demos_collected = 0
         
         # Phase 1: Random Exploration (Learn basics)
-        self.random_steps = 500
+        self.random_steps = 100
         
         # Phase 2: Refinement Exploration (Use trained model to generate better data)
-        self.refinement_rounds = 15          # how many refinement cycles total
-        self.refinement_steps = 300
+        self.refinement_rounds = 10          # how many refinement cycles total
+        self.refinement_steps = 500
         self.refinement_direction = 1 # 1 = Forward, -1 = Backward
         
         self.training_epochs = 10      
@@ -254,8 +254,17 @@ class Robot:
     def _is_stuck(self):
         if len(self.recent_obs_buffer) < 20: return False
         diffs = [np.linalg.norm(self.recent_obs_buffer[i] - self.recent_obs_buffer[i-1]) for i in range(1, len(self.recent_obs_buffer))]
-        return np.mean(diffs) < 0.001
-
+        return  np.mean(diffs) < 0.0015
+            
+        
+    def _is_jittering(self):
+        current_obs = self.recent_obs_buffer[-1]
+        max_spread = max([np.linalg.norm(current_obs - obs) for obs in self.recent_obs_buffer])
+        
+        if max_spread < 0.05: 
+            return True
+            
+        return False
     # -------------------------------------------------------------------------
     # SHARED PLANNER (USED FOR REFINEMENT & TESTING)
     # -------------------------------------------------------------------------
@@ -345,7 +354,7 @@ class Robot:
                 
                 
                 if target_tensor is not None:
-                    track_cost = 1000.0 * torch.sum((sim_obs - target_tensor[t].unsqueeze(0))**2, dim=1)                        
+                    track_cost = 3000.0 * torch.sum((sim_obs - target_tensor[t].unsqueeze(0))**2, dim=1)                        
                     if not recovery:
                         if direction == 1:
                             act_cost = 3000.0 * torch.sum((actions_t - target_act_tensor[t].unsqueeze(0))**2, dim=1)
@@ -468,6 +477,10 @@ class Robot:
 
             # Initialize refinement loop counters
             self.current_refinement_round = 0
+            
+            self.refinement_resets_used = 0
+            self.max_refinement_resets = 6  # how many times we can reset when stuck
+            self.frames_stuck_count = 0
 
             print("STATE: TRAIN_1 -> EXPLORE_REFINEMENT")
             
@@ -477,6 +490,9 @@ class Robot:
             self.planned_actions = [] 
             self.recent_obs_buffer.clear()
             self.refinement_direction = 1
+
+            self.stuck_frames_counter = 0
+            self.target_bump_offset = 0
             
             # Return a wait action so the loop continues without teleporting the robot
             return 1, np.array([0.0, 0.0])
@@ -489,11 +505,32 @@ class Robot:
             else:
                 self.steps_explored += 1
                 
-                # 1. Path Progress
-                current_idx = 0
+                closest_idx = 0
                 if len(self.demo_observations) > 0:
                     dists = [np.linalg.norm(obs - d) for d in self.demo_observations]
-                    current_idx = np.argmin(dists)
+                    closest_idx = np.argmin(dists)
+                
+                # 2. Strict Stuck Detection & Target Bumping
+                is_jittering = self._is_jittering()
+                
+                if is_jittering and not self._is_stuck():
+                    self.stuck_frames_counter += 1
+                    
+                    # If stuck/jittering for 10 consecutive frames, bump the target forward
+                    if self.stuck_frames_counter > 20:
+                        self.target_bump_offset += 2 
+                        self.stuck_frames_counter = 0 
+                        print(f"JITTERING: Bumping target forward by {self.target_bump_offset}")
+                else:
+                    self.stuck_frames_counter = 0
+                    if self.target_bump_offset > 0:
+                        self.target_bump_offset -= 1
+                
+                # 3. Apply the offset based on our current direction
+                if self.refinement_direction == 1:
+                    current_idx = min(closest_idx + self.target_bump_offset, len(self.demo_observations) - 1)
+                else:
+                    current_idx = max(closest_idx - self.target_bump_offset, 0)
                 
                 # 2. Auto-Reverse
                 if self.refinement_direction == 1:
@@ -510,10 +547,30 @@ class Robot:
                 # 3. Logic
                 is_stuck = self._is_stuck()
 
-                # Optional: If we break free early, clear the dumb recovery actions to resume smart planning
-                if not is_stuck and len(self.planned_actions) > self.plan_duration:
-                    print("UNSTUCK: Clearing recovery buffer.")
-                    self.planned_actions = []
+                # --- NEW: STUCK DURATION TRACKING ---
+                if is_stuck:
+                    self.frames_stuck_count += 1
+                else:
+                    self.frames_stuck_count = 0
+                    # If we break free early, clear the dumb recovery actions to resume smart planning
+                    if len(self.planned_actions) > self.plan_duration:
+                        print("UNSTUCK: Clearing recovery buffer.")
+                        self.planned_actions = []
+
+                if self.frames_stuck_count > 200:
+                    if self.refinement_resets_used < self.max_refinement_resets:
+                        print(f"STUCK FOR TOO LONG: Hard Resetting Environment ({self.refinement_resets_used + 1}/{self.max_refinement_resets} used)")
+                        self.refinement_resets_used += 1
+                        self.frames_stuck_count = 0
+                        self.planned_actions = []
+                        self.recent_obs_buffer.clear()
+                        
+                        # Return Action Type 2 to trigger the environment reset
+                        return 2, 0 
+                    else:
+                        print("STUCK FOR TOO LONG: Out of resets! Forcing a new recovery sequence.")
+                        self.frames_stuck_count = 0
+                        self.planned_actions = [] # Clearing this forces the CEM recovery block below to trigger again
 
                 # If stuck, and we ARE NOT already executing a recovery plan
                 if is_stuck and len(self.planned_actions) <= self.plan_duration:
@@ -533,11 +590,11 @@ class Robot:
                         
                     recovery_action = recovery_action.flatten()
                     
-                    # Buffer this max-effort action for 250 steps to punch through the mud
+                    # Buffer this max-effort action for 500 steps to punch through the mud
                     self.planned_actions = [recovery_action for _ in range(500)]
                     action_value = self.planned_actions.pop(0)
 
-                # Execute buffered plan (either normal plan or the 50-step recovery plan)
+                # Execute buffered plan (either normal plan or the 500-step recovery plan)
                 elif len(self.planned_actions) > 0:
                     action_value = self.planned_actions.pop(0).flatten()
                     self.last_cem_action = action_value 
