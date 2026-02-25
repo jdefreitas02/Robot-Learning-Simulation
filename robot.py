@@ -23,14 +23,16 @@ class DynamicsModel(nn.Module):
     def forward(self, obs, act):
         # Scale action up slightly to match magnitude of observations for better training
         x = torch.cat([obs, act * 10.0], dim=-1)
-        delta = self.net(x)
+        delta = self.net(x) 
         return delta
 
 class Robot:
     def __init__(self):
         # Hyperparameters
         self.demo_length = 30          
-        self.target_demos = 2          
+        self.max_demos = 6          # Changed: Maximum allowed demos to prevent blowing the budget
+        self.goal_threshold = 0.1  # Lowered: We only stop when we are right on the goal line
+        self.current_dist = float('inf') # Tracks the latest distance to goal
         self.num_demos_collected = 0
         
         # Phase 1: Random Exploration (Learn basics)
@@ -46,11 +48,11 @@ class Robot:
         self.lr = 0.001
         
         # MPC / CEM Parameters
-        self.planning_horizon = 4    
+        self.planning_horizon = 2    
         self.cem_iterations = 6
         self.cem_num_samples = 100
         self.cem_num_elites = 10     
-        self.plan_duration = 4        
+        self.plan_duration = 2        
         
         # State Management
         self.demo_buffer = []
@@ -165,7 +167,7 @@ class Robot:
                 efficiency = speed / (effort + 1e-6)
                 
                 if target_tensor is not None:
-                    track_cost = 3000.0 * torch.sum((sim_obs - target_tensor[t].unsqueeze(0))**2, dim=1)                        
+                    track_cost = 7000.0 * torch.sum((sim_obs - target_tensor[t].unsqueeze(0))**2, dim=1)                        
                     if not recovery:
                         if direction == 1:
                             act_cost = 3000.0 * torch.sum((actions_t - target_act_tensor[t].unsqueeze(0))**2, dim=1)
@@ -185,17 +187,20 @@ class Robot:
     # TRAINING MAIN LOOP
     # -------------------------------------------------------------------------
     def training_action(self, obs, money):
-        if money < 5:
+        # SAFETY NET: If budget is running critically low, abort training to avoid penalties.
+        # You may need to tune '100' depending on how much a step costs in your constants.py
+        if money < 7:
             self.state_machine = 'DONE'
             return 4, 0
+
         self._update_stuck_buffer(obs)
         action_type, action_value = 4, 0
         
         # --- 1. COLLECT DEMOS ---
         if self.state_machine == 'START':
-            #print("STATE: START -> REPLAY")
             self.num_demos_collected, self.replay_index, self.demo_buffer = 1, 0, []
             self.state_machine = 'REPLAY'
+            # print('COLLECTING DEMONSTRATION 1')
             return 3, self.demo_length 
 
         if self.state_machine == 'REPLAY':
@@ -205,21 +210,29 @@ class Robot:
                 action_value = np.clip(action, -constants.MAX_ACTION_MAGNITUDE, constants.MAX_ACTION_MAGNITUDE)
                 action_type = 1
             else:
-                if self.num_demos_collected < self.target_demos:
-                    #print("STATE: REPLAY -> GET_DEMO_2")
+                # DYNAMIC DEMO LOGIC: 
+                # If we are basically at the goal, or hit our budget cap, stop.
+                if self.current_dist < self.goal_threshold or self.num_demos_collected >= self.max_demos:
+                    self.state_machine = 'EXPLORE_RANDOM'
+                    self.steps_explored = 0
+                else:
                     self.num_demos_collected += 1
                     self.replay_index, self.demo_buffer = 0, []
                     self.state_machine = 'REPLAY'
-                    return 3, self.demo_length
-                else:
-                    #print("STATE: REPLAY -> EXPLORE_RANDOM")
-                    self.state_machine = 'EXPLORE_RANDOM'
-                    self.steps_explored = 0
+                    
+                    # CALCULATE DYNAMIC LENGTH:
+                    # Estimate steps needed based on a conservative average speed (e.g. 0.025 units/step).
+                    # We add a small buffer (+3 steps) to ensure it definitively crosses the line.
+                    estimated_steps = int(self.current_dist / 0.025) + 3
+                    
+                    # Cap it at self.demo_length so we don't ask for a massive demo in one go
+                    dynamic_length = min(self.demo_length, max(5, estimated_steps))
+                    # print(f'COLLECTING DEMONSTRATION {self.num_demos_collected} with length {dynamic_length}')
+                    return 3, dynamic_length
             
         # --- 2. RANDOM EXPLORATION ---
         if self.state_machine == 'EXPLORE_RANDOM':
             if self.steps_explored >= self.random_steps:
-                #print("STATE: EXPLORE_RANDOM -> TRAIN_1")
                 self.state_machine = 'TRAIN_1'
             else:
                 self.steps_explored += 1
@@ -227,7 +240,6 @@ class Robot:
                 
                 if is_stuck:
                     if self.explore_action_duration <= 0:
-                        #print("STUCK")
                         angle = np.random.uniform(0, 2 * np.pi)
                         self.current_explore_action = np.array([
                             constants.MAX_ACTION_MAGNITUDE * np.cos(angle),
@@ -255,7 +267,6 @@ class Robot:
 
         # --- 3. FIRST TRAINING ---
         if self.state_machine == 'TRAIN_1':
-            #print(f"Training Model 1 on {len(self.memory)} data points...")
             self.train_models()
 
             self.current_refinement_round = 0
@@ -263,7 +274,6 @@ class Robot:
             self.max_refinement_resets = 6
             self.frames_stuck_count = 0
 
-            #print("STATE: TRAIN_1 -> EXPLORE_REFINEMENT")
             self.state_machine = 'EXPLORE_REFINEMENT'
             self.steps_explored = 0
             self.planned_actions = [] 
@@ -279,7 +289,6 @@ class Robot:
         # --- 4. REFINEMENT EXPLORATION ---
         if self.state_machine == 'EXPLORE_REFINEMENT':
             if self.steps_explored >= self.refinement_steps:
-                #print("STATE: EXPLORE_REFINEMENT -> TRAIN_2")
                 self.state_machine = 'TRAIN_2'
             else:
                 self.steps_explored += 1
@@ -296,7 +305,6 @@ class Robot:
                     if self.stuck_frames_counter > 20:
                         self.target_bump_offset += 2 
                         self.stuck_frames_counter = 0 
-                        #print(f"JITTERING: Bumping target forward by {self.target_bump_offset}")
                 else:
                     self.stuck_frames_counter = 0
                     if self.target_bump_offset > 0:
@@ -311,12 +319,10 @@ class Robot:
                 # Auto-Reverse
                 if self.refinement_direction == 1:
                     if current_idx >= len(self.demo_observations) - 10:
-                        #print("Switching to BACKWARD refinement")
                         self.refinement_direction = -1
                         self.planned_actions = [] 
                 else:
                     if current_idx <= 2:
-                        #print("Switching to FORWARD refinement")
                         self.refinement_direction = 1
                         self.planned_actions = []
 
@@ -328,26 +334,22 @@ class Robot:
                 else:
                     self.frames_stuck_count = 0
                     if len(self.planned_actions) > self.plan_duration:
-                        #print("UNSTUCK: Clearing recovery buffer.")
                         self.planned_actions = []
 
                 if self.frames_stuck_count > 200:
                     if self.refinement_resets_used < self.max_refinement_resets:
-                        #print(f"STUCK FOR TOO LONG: Hard Resetting Environment ({self.refinement_resets_used + 1}/{self.max_refinement_resets} used)")
                         self.refinement_resets_used += 1
                         self.frames_stuck_count = 0
                         self.planned_actions = []
                         self.recent_obs_buffer.clear()
                         return 2, 0 
                     else:
-                        #print("STUCK FOR TOO LONG: Out of resets! Forcing a new recovery sequence.")
                         self.frames_stuck_count = 0
                         self.planned_actions = [] 
 
                 # If stuck and not currently executing a recovery plan
                 if is_stuck and len(self.planned_actions) <= self.plan_duration:
                     self.planned_actions = []
-                    #print("STUCK: Running CEM once, buffering MAX effort actions.")
                     
                     best_seq = self._run_cem(obs, direction=self.refinement_direction, recovery=True)
                     first_action = best_seq[0]
@@ -379,11 +381,9 @@ class Robot:
         # --- 5. ITERATIVE REFINEMENT TRAINING ---
         if self.state_machine == 'TRAIN_2':
             self.current_refinement_round += 1
-            #print(f"Training Refinement Round {self.current_refinement_round}/{self.refinement_rounds} on {len(self.memory)} samples...")
             self.train_models()
 
             if self.current_refinement_round < self.refinement_rounds:
-                #print("STATE: TRAIN_2 -> EXPLORE_REFINEMENT")
                 self.state_machine = 'EXPLORE_REFINEMENT'
                 
                 self.steps_explored = 0
@@ -392,7 +392,6 @@ class Robot:
                 
                 return 1, np.array([0.0, 0.0]) 
             else:
-                #print("STATE: TRAIN_2 -> DONE")
                 self.state_machine = 'DONE'
                 self.recent_obs_buffer.clear()
                 return 4, 0
@@ -401,6 +400,7 @@ class Robot:
 
     def receive_transition(self, obs, action, next_obs, distance_to_goal):
         self.memory.append((obs, action, next_obs, distance_to_goal))
+        self.current_dist = distance_to_goal  # Track the most recent distance!
 
     def receive_demo(self, demo):
         for obs, act in demo:
@@ -435,9 +435,6 @@ class Robot:
                 dyn_loss.backward()
                 self.dynamics_opt.step()
                 total_dyn_loss += dyn_loss.item()
-            
-            # if epoch % 10 == 0:
-                #print(f"Epoch {epoch}: DynLoss={total_dyn_loss:.4f}")
 
     # -------------------------------------------------------------------------
     # TESTING MAIN LOOP
@@ -448,13 +445,11 @@ class Robot:
 
         # --- 1. EXIT RECOVERY ---
         if not is_stuck and len(self.planned_actions) > self.plan_duration:
-            #print("UNSTUCK: Clearing recovery buffer to resume smart planning.")
             self.planned_actions = []
 
         # --- 2. ENTER RECOVERY ---
         if is_stuck:
             if len(self.planned_actions) <= self.plan_duration:
-                #print("STUCK: Generating 200-step fixed recovery plan.")
                 self.planned_actions = []
                 
                 best_seq = self._run_cem(obs, direction=1, recovery=True)
