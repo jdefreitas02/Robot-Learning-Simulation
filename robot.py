@@ -116,6 +116,11 @@ class Robot:
         if len(self.recent_obs_buffer) < 20: return False
         diffs = [np.linalg.norm(self.recent_obs_buffer[i] - self.recent_obs_buffer[i-1]) for i in range(1, len(self.recent_obs_buffer))]
         return np.mean(diffs) < 0.002
+    
+    def _is_stuck_test(self):
+        if len(self.recent_obs_buffer) < 20: return False
+        diffs = [np.linalg.norm(self.recent_obs_buffer[i] - self.recent_obs_buffer[i-1]) for i in range(1, len(self.recent_obs_buffer))]
+        return np.mean(diffs) < 0.001
             
     def _is_jittering(self):
         current_obs = self.recent_obs_buffer[-1]
@@ -540,23 +545,34 @@ class Robot:
     # -------------------------------------------------------------------------
     def testing_action(self, obs):
         self._update_stuck_buffer(obs)
+        is_stuck = self._is_stuck_test()
         
-        # 1. Fallback Recovery (Just in case the robot hits a wall hard)
-        if self._is_stuck():
-            if self.recovery_steps <= 0:
-                print("Robot stuck during testing! Using fallback recovery action.")
-                self.recovery_steps = 10
-                angle = np.random.uniform(-np.pi/3, np.pi/3) # Push generally forward
-                self.recovery_action = np.array([
-                    constants.MAX_ACTION_MAGNITUDE * np.cos(angle), 
-                    constants.MAX_ACTION_MAGNITUDE * np.sin(angle)
-                ])
-            self.recovery_steps -= 1
-            return self.recovery_action
+        # 1. Clear recovery buffer if unstuck
+        if not is_stuck and len(self.planned_actions) > 0:
+            print("Robot unstuck! Resuming Behavioural Cloning.")
+            self.planned_actions = []
+            
+        # 2. CEM Fallback Recovery
+        if is_stuck:
+            if len(self.planned_actions) == 0:
+                print("Robot stuck during testing! Reverting to CEM for recovery.")
+                
+                # Use the Dynamics Model and CEM to mathematically plan an escape route
+                best_seq = self._run_cem(obs, direction=1, recovery=True)
+                first_action = best_seq[0]
+                
+                norm = np.linalg.norm(first_action)
+                if norm > 1e-6:
+                    recovery_action = (first_action / norm) * constants.MAX_ACTION_MAGNITUDE
+                else:
+                    recovery_action = np.array([constants.MAX_ACTION_MAGNITUDE, 0.0])
+                
+                # Buffer the CEM's chosen recovery action for 5 frames to push out of the mud
+                self.planned_actions = [recovery_action.flatten() for _ in range(5)]
+                
+            return self.planned_actions.pop(0)
         
-        self.recovery_steps = 0
-        
-        # 2. Pure Behavioural Cloning Execution
+        # 3. Pure Behavioural Cloning Execution
         self.bc_model.eval()
         with torch.no_grad():
             obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
