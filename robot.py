@@ -13,11 +13,11 @@ class DynamicsModel(nn.Module):
         # Input: Observation + Action
         # Output: Delta Observation (Next Obs - Current Obs)
         self.net = nn.Sequential(
-            nn.Linear(obs_dim + act_dim, 256),
+            nn.Linear(obs_dim + act_dim, 128),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(256, obs_dim)
+            nn.Linear(128, obs_dim)
         )
 
     def forward(self, obs, act):
@@ -26,22 +26,40 @@ class DynamicsModel(nn.Module):
         delta = self.net(x) 
         return delta
 
+class BCModel(nn.Module):
+    def __init__(self, obs_dim, act_dim):
+        super(BCModel, self).__init__()
+        # Input: Observation
+        # Output: Predicted Expert Action
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, act_dim)
+        )
+
+    def forward(self, obs):
+        return self.net(obs)
+
 class Robot:
     def __init__(self):
         # Hyperparameters
         self.demo_length = 30          
-        self.max_demos = 6          # Changed: Maximum allowed demos to prevent blowing the budget
-        self.goal_threshold = 0.1  # Lowered: We only stop when we are right on the goal line
-        self.current_dist = float('inf') # Tracks the latest distance to goal
+        self.max_demos = 6          
+        self.current_dist = float('inf') 
+        self.min_dist = float('inf')      # NEW: Tracks the closest we've ever been
+        self.crossed_line = False         # NEW: Flag to definitively know we passed the goal
         self.num_demos_collected = 0
+        self.last_dist = None   
         
         # Phase 1: Random Exploration (Learn basics)
         self.random_steps = 100
         
         # Phase 2: Refinement Exploration (Use trained model to generate better data)
-        self.refinement_rounds = 10          
-        self.refinement_steps = 500
-        self.refinement_direction = 1 # 1 = Forward, -1 = Backward
+        self.refinement_rounds = 30          
+        self.refinement_steps = 200
+        self.refinement_direction = 1 
         
         self.training_epochs = 10      
         self.batch_size = 64
@@ -49,10 +67,10 @@ class Robot:
         
         # MPC / CEM Parameters
         self.planning_horizon = 2    
-        self.cem_iterations = 6
-        self.cem_num_samples = 100
-        self.cem_num_elites = 10     
-        self.plan_duration = 2        
+        self.cem_iterations = 4
+        self.cem_num_samples = 40
+        self.cem_num_elites = 5     
+        self.plan_duration = 1        
         
         # State Management
         self.demo_buffer = []
@@ -63,20 +81,31 @@ class Robot:
         self.current_explore_action = None
         self.explore_action_duration = 0
         
+        # Fallback tracking
         self.recent_obs_buffer = collections.deque(maxlen=20)
         self.planned_actions = []
+        self.recovery_steps = 0
+        self.recovery_action = np.zeros(2)
         
         # Data Storage
         self.memory = collections.deque(maxlen=20000)
         self.demo_observations = []
         self.demo_actions = [] 
         
+        # Synthetic BC Data Storage
+        self.synthetic_dataset = []
+        self.current_trajectory = []
+        self.last_recorded_obs = None  # Tracks progress for filtering stuck frames
+        
         # Models
         self.device = torch.device("cpu") # GPU prohibited
         self.dynamics_model = DynamicsModel(constants.OBSERVATION_DIMENSION, constants.ACTION_DIMENSION).to(self.device)
         self.dynamics_opt = optim.Adam(self.dynamics_model.parameters(), lr=self.lr)
 
+        self.bc_model = BCModel(constants.OBSERVATION_DIMENSION, constants.ACTION_DIMENSION).to(self.device)
+        self.bc_opt = optim.Adam(self.bc_model.parameters(), lr=0.001)
         self.visualisation_lines = []
+
     # -------------------------------------------------------------------------
     # STUCK DETECTION
     # -------------------------------------------------------------------------
@@ -86,17 +115,17 @@ class Robot:
     def _is_stuck(self):
         if len(self.recent_obs_buffer) < 20: return False
         diffs = [np.linalg.norm(self.recent_obs_buffer[i] - self.recent_obs_buffer[i-1]) for i in range(1, len(self.recent_obs_buffer))]
-        return np.mean(diffs) < 0.0015
+        return np.mean(diffs) < 0.002
             
     def _is_jittering(self):
         current_obs = self.recent_obs_buffer[-1]
         max_spread = max([np.linalg.norm(current_obs - obs) for obs in self.recent_obs_buffer])
-        return max_spread < 0.05
+        return max_spread < 0.10
 
     # -------------------------------------------------------------------------
-    # SHARED PLANNER (USED FOR REFINEMENT & TESTING)
+    # SHARED PLANNER (USED FOR REFINEMENT)
     # -------------------------------------------------------------------------
-    def _run_cem(self, obs, direction=1, recovery=False, test=False):
+    def _run_cem(self, obs, direction=1, recovery=False, bump_offset=0):
         self.dynamics_model.eval()
         
         curr_obs = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -111,32 +140,22 @@ class Robot:
                     best_dist, closest_idx = d, i
             
             target_obs_seq = []
-            target_act_seq = []
-            
+            lookahead = 1 + bump_offset
+
             for t in range(self.planning_horizon):
                 if direction == 1:
-                    # Looking forward
-                    obs_idx = min(closest_idx + t + 1, len(self.demo_observations) - 1)
-                    act_idx = min(closest_idx + t, len(self.demo_actions) - 1)
+                    obs_idx = min(closest_idx + t + lookahead, len(self.demo_observations) - 1)
                     target_obs_seq.append(self.demo_observations[obs_idx])
-                    target_act_seq.append(self.demo_actions[act_idx])
                 else:
-                    # Looking backward
-                    obs_idx = max(closest_idx - t - 1, 0)
-                    act_idx = max(closest_idx - t - 1, 0)
+                    obs_idx = max(closest_idx - t - lookahead, 0)
                     target_obs_seq.append(self.demo_observations[obs_idx])
-                    target_act_seq.append(-1.0 * self.demo_actions[act_idx])
 
             target_tensor = torch.tensor(np.array(target_obs_seq), dtype=torch.float32).to(self.device)
-            target_act_tensor = torch.tensor(np.array(target_act_seq), dtype=torch.float32).to(self.device)
         else:
             target_tensor = None
-            target_act_tensor = None
 
         # 2. Initialize Mean
         action_mean = torch.zeros(self.planning_horizon, constants.ACTION_DIMENSION).to(self.device)
-        if target_act_tensor is not None and not recovery:
-             action_mean = target_act_tensor.clone()
         
         std_mag = 0.5 if not recovery else 0.8
         action_std = torch.ones(self.planning_horizon, constants.ACTION_DIMENSION).to(self.device) * std_mag * constants.MAX_ACTION_MAGNITUDE
@@ -158,23 +177,9 @@ class Robot:
                 sim_obs = sim_obs + delta
                 
                 track_cost = 0
-                act_cost = 0
-                stuck_cost = 0 
-                
-                # Sticky Area Punishment Calculation
-                speed = torch.norm(delta, dim=1)
-                effort = torch.norm(actions_t, dim=1)
-                efficiency = speed / (effort + 1e-6)
-                
                 if target_tensor is not None:
-                    track_cost = 7000.0 * torch.sum((sim_obs - target_tensor[t].unsqueeze(0))**2, dim=1)                        
-                    if not recovery:
-                        if direction == 1:
-                            act_cost = 3000.0 * torch.sum((actions_t - target_act_tensor[t].unsqueeze(0))**2, dim=1)
-                        if test:
-                            stuck_cost = 300.0 * torch.relu(0.5 - efficiency)
-                
-                costs += track_cost + act_cost + stuck_cost
+                    track_cost = 10000.0 * torch.sum((sim_obs - target_tensor[t].unsqueeze(0))**2, dim=1)                        
+                costs += track_cost
             
             elites = samples[torch.topk(costs, self.cem_num_elites, largest=False)[1]]
             action_mean = elites.mean(dim=0)
@@ -187,9 +192,10 @@ class Robot:
     # TRAINING MAIN LOOP
     # -------------------------------------------------------------------------
     def training_action(self, obs, money):
-        # SAFETY NET: If budget is running critically low, abort training to avoid penalties.
-        # You may need to tune '100' depending on how much a step costs in your constants.py
         if money < 7:
+            if self.state_machine != 'DONE':
+                print("Budget critically low! Forcing final model training and exit.")
+                self.train_models() 
             self.state_machine = 'DONE'
             return 4, 0
 
@@ -198,9 +204,9 @@ class Robot:
         
         # --- 1. COLLECT DEMOS ---
         if self.state_machine == 'START':
+            print("STATE: START -> Requesting initial demo.")
             self.num_demos_collected, self.replay_index, self.demo_buffer = 1, 0, []
             self.state_machine = 'REPLAY'
-            # print('COLLECTING DEMONSTRATION 1')
             return 3, self.demo_length 
 
         if self.state_machine == 'REPLAY':
@@ -210,9 +216,8 @@ class Robot:
                 action_value = np.clip(action, -constants.MAX_ACTION_MAGNITUDE, constants.MAX_ACTION_MAGNITUDE)
                 action_type = 1
             else:
-                # DYNAMIC DEMO LOGIC: 
-                # If we are basically at the goal, or hit our budget cap, stop.
-                if self.current_dist < self.goal_threshold or self.num_demos_collected >= self.max_demos:
+                if self.crossed_line or self.num_demos_collected >= self.max_demos:
+                    print(f"Goal crossed or max demos hit. Moving to EXPLORE_RANDOM. Collected {self.num_demos_collected} demos.")
                     self.state_machine = 'EXPLORE_RANDOM'
                     self.steps_explored = 0
                 else:
@@ -220,19 +225,15 @@ class Robot:
                     self.replay_index, self.demo_buffer = 0, []
                     self.state_machine = 'REPLAY'
                     
-                    # CALCULATE DYNAMIC LENGTH:
-                    # Estimate steps needed based on a conservative average speed (e.g. 0.025 units/step).
-                    # We add a small buffer (+3 steps) to ensure it definitively crosses the line.
-                    estimated_steps = int(self.current_dist / 0.025) + 3
-                    
-                    # Cap it at self.demo_length so we don't ask for a massive demo in one go
+                    estimated_steps = int(self.current_dist / 0.025) + 10
                     dynamic_length = min(self.demo_length, max(5, estimated_steps))
-                    # print(f'COLLECTING DEMONSTRATION {self.num_demos_collected} with length {dynamic_length}')
+                    print(f"Requesting continuing demo (Number {self.num_demos_collected}), length {dynamic_length}...")
                     return 3, dynamic_length
             
         # --- 2. RANDOM EXPLORATION ---
         if self.state_machine == 'EXPLORE_RANDOM':
             if self.steps_explored >= self.random_steps:
+                print("STATE: EXPLORE_RANDOM -> TRAIN_1")
                 self.state_machine = 'TRAIN_1'
             else:
                 self.steps_explored += 1
@@ -267,13 +268,15 @@ class Robot:
 
         # --- 3. FIRST TRAINING ---
         if self.state_machine == 'TRAIN_1':
+            print("Starting Initial Phase 1 Training...")
             self.train_models()
 
             self.current_refinement_round = 0
             self.refinement_resets_used = 0
-            self.max_refinement_resets = 6
+            self.max_refinement_resets = 7 - self.num_demos_collected
             self.frames_stuck_count = 0
 
+            print("STATE: TRAIN_1 -> EXPLORE_REFINEMENT")
             self.state_machine = 'EXPLORE_REFINEMENT'
             self.steps_explored = 0
             self.planned_actions = [] 
@@ -283,12 +286,12 @@ class Robot:
             self.stuck_frames_counter = 0
             self.target_bump_offset = 0
             
-            # Keep loop alive without teleporting robot
             return 1, np.array([0.0, 0.0])
 
         # --- 4. REFINEMENT EXPLORATION ---
         if self.state_machine == 'EXPLORE_REFINEMENT':
             if self.steps_explored >= self.refinement_steps:
+                print(f"Completed {self.refinement_steps} exploration steps. Transitioning to TRAIN_2.")
                 self.state_machine = 'TRAIN_2'
             else:
                 self.steps_explored += 1
@@ -303,30 +306,51 @@ class Robot:
                 if is_jittering and not self._is_stuck():
                     self.stuck_frames_counter += 1
                     if self.stuck_frames_counter > 20:
-                        self.target_bump_offset += 2 
+                        if self.refinement_direction == 1 and closest_idx >= len(self.demo_observations) - 5:
+                            print("Jittering near END of demo. Forcing early turnaround (BACKWARD).")
+                            self.refinement_direction = -1
+                            self.target_bump_offset = 0
+                            self.planned_actions = []
+                        elif self.refinement_direction == -1 and closest_idx <= 5:
+                            print("Jittering near START of demo. Forcing early turnaround (FORWARD).")
+                            self.refinement_direction = 1
+                            self.target_bump_offset = 0
+                            self.planned_actions = []
+                        else:
+                            # Cap the bump offset to 8 to prevent massive unphysical target jumps
+                            self.target_bump_offset = min(self.target_bump_offset + 2, 8) 
+                            print(f"ref direction: {self.refinement_direction}, Jittering detected near frame {closest_idx}/{len(self.demo_observations) - 1}. Bump offset: {self.target_bump_offset}")
                         self.stuck_frames_counter = 0 
                 else:
                     self.stuck_frames_counter = 0
                     if self.target_bump_offset > 0:
                         self.target_bump_offset -= 1
                 
-                # Apply offset based on direction
                 if self.refinement_direction == 1:
                     current_idx = min(closest_idx + self.target_bump_offset, len(self.demo_observations) - 1)
                 else:
                     current_idx = max(closest_idx - self.target_bump_offset, 0)
                 
-                # Auto-Reverse
+                # Reverse directions
                 if self.refinement_direction == 1:
-                    if current_idx >= len(self.demo_observations) - 10:
+                    if current_idx >= len(self.demo_observations) - 1:
                         self.refinement_direction = -1
                         self.planned_actions = [] 
+                        
+                        # Only keep this synthetic demo if we successfully logged enough frames
+                        if len(self.current_trajectory) > 10:
+                            self.synthetic_dataset.extend(self.current_trajectory)
+                            print(f"Added synthetic trajectory of length {len(self.current_trajectory)}. Total synthetic dataset size: {len(self.synthetic_dataset)}")
+                            
+                        self.current_trajectory = [] # Clear ready for next forward pass
+                        self.last_recorded_obs = None
                 else:
-                    if current_idx <= 2:
+                    if current_idx <= 0:
                         self.refinement_direction = 1
                         self.planned_actions = []
+                        self.current_trajectory = [] # Ensure clean slate
+                        self.last_recorded_obs = None
 
-                # Logic & Stuck Handling
                 is_stuck = self._is_stuck()
 
                 if is_stuck:
@@ -336,62 +360,83 @@ class Robot:
                     if len(self.planned_actions) > self.plan_duration:
                         self.planned_actions = []
 
-                if self.frames_stuck_count > 200:
+                if self.frames_stuck_count > 100:
                     if self.refinement_resets_used < self.max_refinement_resets:
+                        print(f"Stuck for >100 frames! Hard reset used: {self.refinement_resets_used + 1}/{self.max_refinement_resets}")
                         self.refinement_resets_used += 1
                         self.frames_stuck_count = 0
                         self.planned_actions = []
                         self.recent_obs_buffer.clear()
+                        self.current_trajectory = []
+                        self.last_recorded_obs = None
                         return 2, 0 
                     else:
                         self.frames_stuck_count = 0
                         self.planned_actions = [] 
+                        self.current_trajectory = []
+                        self.last_recorded_obs = None
 
-                # If stuck and not currently executing a recovery plan
+                # --- ACTION SELECTION ---
                 if is_stuck and len(self.planned_actions) <= self.plan_duration:
                     self.planned_actions = []
-                    
-                    best_seq = self._run_cem(obs, direction=self.refinement_direction, recovery=True)
+                    best_seq = self._run_cem(obs, direction=self.refinement_direction, recovery=True, bump_offset=self.target_bump_offset)
                     first_action = best_seq[0]
-                    
                     norm = np.linalg.norm(first_action)
                     if norm > 1e-6:
                         recovery_action = (first_action / norm) * constants.MAX_ACTION_MAGNITUDE
                     else:
                         recovery_action = np.array([constants.MAX_ACTION_MAGNITUDE, 0.0])
-                        
-                    recovery_action = recovery_action.flatten()
-                    self.planned_actions = [recovery_action for _ in range(500)]
-                    action_value = self.planned_actions.pop(0)
-
-                # Execute buffered plan
-                elif len(self.planned_actions) > 0:
-                    action_value = self.planned_actions.pop(0).flatten()
-                    self.last_cem_action = action_value 
                     
-                # Normal Planning
+                    clean_action = recovery_action.flatten()
+                    self.planned_actions = [clean_action.copy() for _ in range(4)] # buffer rest
+
+                elif len(self.planned_actions) > 0:
+                    clean_action = self.planned_actions.pop(0).flatten()
                 else:
-                    best_seq = self._run_cem(obs, direction=self.refinement_direction, recovery=False)
+                    best_seq = self._run_cem(obs, direction=self.refinement_direction, recovery=False, bump_offset=self.target_bump_offset)
                     self.planned_actions = list(best_seq[:self.plan_duration])
-                    action_value = self.planned_actions.pop(0).flatten()
-                    self.last_cem_action = action_value
+                    clean_action = self.planned_actions.pop(0).flatten()
                 
+                # --- DAGGER NOISE & THE "CLEAN LABEL" TRICK ---
+                action_value = clean_action.copy()
+                
+                if self.refinement_direction == 1:
+                    # PROGRESS FILTER: Check if we have actually moved enough to justify recording this frame.
+                    moved_enough = True
+                    if self.last_recorded_obs is not None:
+                        if np.linalg.norm(obs - self.last_recorded_obs) < 0.005:
+                            moved_enough = False
+
+                    if moved_enough and not is_stuck:
+                        # 1. Add noise for actual physical execution
+                        action_value += np.random.normal(0, 0.005, size=constants.ACTION_DIMENSION)
+                        action_value = np.clip(action_value, -constants.MAX_ACTION_MAGNITUDE, constants.MAX_ACTION_MAGNITUDE)
+                        
+                        # 2. Save the perfect, un-noised label to our BC dataset
+                        self.current_trajectory.append((obs, clean_action.copy()))
+                        self.last_recorded_obs = obs.copy()
+
                 action_type = 1
 
         # --- 5. ITERATIVE REFINEMENT TRAINING ---
         if self.state_machine == 'TRAIN_2':
+            print(f"Starting Refinement Training Round {self.current_refinement_round + 1}/{self.refinement_rounds}...")
             self.current_refinement_round += 1
             self.train_models()
 
             if self.current_refinement_round < self.refinement_rounds:
+                print(f"Round {self.current_refinement_round} complete. Back to EXPLORE_REFINEMENT.")
                 self.state_machine = 'EXPLORE_REFINEMENT'
                 
                 self.steps_explored = 0
                 self.planned_actions = []
                 self.recent_obs_buffer.clear()
+                self.current_trajectory = [] # Reset for safety
+                self.last_recorded_obs = None
                 
                 return 1, np.array([0.0, 0.0]) 
             else:
+                print("All refinement rounds complete. STATE -> DONE.")
                 self.state_machine = 'DONE'
                 self.recent_obs_buffer.clear()
                 return 4, 0
@@ -400,8 +445,25 @@ class Robot:
 
     def receive_transition(self, obs, action, next_obs, distance_to_goal):
         self.memory.append((obs, action, next_obs, distance_to_goal))
-        self.current_dist = distance_to_goal  # Track the most recent distance!
+        self.current_dist = distance_to_goal  
+        
+        # INFLECTION POINT DETECTION
+        if distance_to_goal < self.min_dist:
+            self.min_dist = distance_to_goal
 
+        if self.state_machine == 'REPLAY':
+            if self.last_dist is not None:
+                # 1. Distance definitively increased after reaching a minimum
+                if distance_to_goal > self.min_dist + 0.015 and self.min_dist < 0.1:
+                    self.crossed_line = True
+                    print("Detected goal crossing via distance increase after minimum. Marking goal as crossed to avoid demo corruption.")
+                
+                # 2. Distance is artificially locked at exactly 0.05 
+                elif abs(distance_to_goal - 0.05) < 1e-7 and abs(self.last_dist - 0.05) < 1e-7:
+                    self.crossed_line = True
+                    print("Detected potential wall collision (distance locked at 0.05). Marking goal as crossed to avoid demo corruption.")
+                    
+            self.last_dist = distance_to_goal
     def receive_demo(self, demo):
         for obs, act in demo:
             self.demo_observations.append(obs)
@@ -410,68 +472,95 @@ class Robot:
         self.demo_buffer = [d[1] for d in demo]
 
     def train_models(self):
-        if len(self.memory) < self.batch_size:
-            return
+        # 1. Train Dynamics Model (for the CEM Expert)
+        if len(self.memory) >= self.batch_size:
+            print(f"Training Dynamics Model on {len(self.memory)} transitions...")
+            obs_batch, act_batch, next_obs_batch, dist_batch = zip(*self.memory)
+            
+            obs_t = torch.tensor(np.array(obs_batch), dtype=torch.float32).to(self.device)
+            act_t = torch.tensor(np.array(act_batch), dtype=torch.float32).to(self.device)
+            next_obs_t = torch.tensor(np.array(next_obs_batch), dtype=torch.float32).to(self.device)
+            
+            delta_target = next_obs_t - obs_t
+            dataset = torch.utils.data.TensorDataset(obs_t, act_t, delta_target)
+            loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        obs_batch, act_batch, next_obs_batch, dist_batch = zip(*self.memory)
+            self.dynamics_model.train()
+            for epoch in range(self.training_epochs):
+                total_dyn_loss = 0.0
+                for o, a, d_target in loader:
+                    pred_delta = self.dynamics_model(o, a)
+                    dyn_loss = nn.MSELoss()(pred_delta, d_target)
+                    self.dynamics_opt.zero_grad()
+                    dyn_loss.backward()
+                    self.dynamics_opt.step()
+                    total_dyn_loss += dyn_loss.item()
+                if (epoch + 1) % 5 == 0 or epoch == 0:
+                    print(f"  Dynamics Epoch {epoch+1}/{self.training_epochs} - Avg Loss: {total_dyn_loss / len(loader):.6f}")
+
+        # 2. Train Behavioural Cloning Model (The Fast Student)
+        bc_obs = []
+        bc_act = []
         
-        obs_t = torch.tensor(np.array(obs_batch), dtype=torch.float32).to(self.device)
-        act_t = torch.tensor(np.array(act_batch), dtype=torch.float32).to(self.device)
-        next_obs_t = torch.tensor(np.array(next_obs_batch), dtype=torch.float32).to(self.device)
-        dist_t = torch.tensor(np.array(dist_batch), dtype=torch.float32).unsqueeze(1).to(self.device)
-        
-        delta_target = next_obs_t - obs_t
-        dataset = torch.utils.data.TensorDataset(obs_t, act_t, delta_target, dist_t)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        # EXPERT WEIGHTING: Add the original, perfectly clean expert demos 10 times over
+        if len(self.demo_observations) > 0:
+            for _ in range(10):
+                bc_obs.extend(self.demo_observations)
+                bc_act.extend(self.demo_actions)
+                
+        # Include the auto-generated, noise-recovering synthetic dataset
+        if len(self.synthetic_dataset) > 0:
+            synth_o, synth_a = zip(*self.synthetic_dataset)
+            bc_obs.extend(synth_o)
+            bc_act.extend(synth_a)
 
-        self.dynamics_model.train()
-
-        for epoch in range(self.training_epochs):
-            total_dyn_loss = 0
-            for o, a, d_target, dist_target in loader:
-                pred_delta = self.dynamics_model(o, a)
-                dyn_loss = nn.MSELoss()(pred_delta, d_target)
-                self.dynamics_opt.zero_grad()
-                dyn_loss.backward()
-                self.dynamics_opt.step()
-                total_dyn_loss += dyn_loss.item()
+        if len(bc_obs) >= self.batch_size:
+            print(f"Training BC Model on {len(bc_obs)} transitions (Expert + Synthetic)...")
+            bc_o_t = torch.tensor(np.array(bc_obs), dtype=torch.float32).to(self.device)
+            bc_a_t = torch.tensor(np.array(bc_act), dtype=torch.float32).to(self.device)
+            
+            bc_dataset = torch.utils.data.TensorDataset(bc_o_t, bc_a_t)
+            bc_loader = torch.utils.data.DataLoader(bc_dataset, batch_size=self.batch_size, shuffle=True)
+            
+            self.bc_model.train()
+            for epoch in range(self.training_epochs): 
+                total_bc_loss = 0.0
+                for o, a in bc_loader:
+                    pred_a = self.bc_model(o)
+                    loss = nn.MSELoss()(pred_a, a)
+                    self.bc_opt.zero_grad()
+                    loss.backward()
+                    self.bc_opt.step()
+                    total_bc_loss += loss.item()
+                if (epoch + 1) % 5 == 0 or epoch == 0:
+                    print(f"  BC Epoch {epoch+1}/{self.training_epochs} - Avg Loss: {total_bc_loss / len(bc_loader):.6f}")
 
     # -------------------------------------------------------------------------
     # TESTING MAIN LOOP
     # -------------------------------------------------------------------------
     def testing_action(self, obs):
         self._update_stuck_buffer(obs)
-        is_stuck = self._is_stuck()
-
-        # --- 1. EXIT RECOVERY ---
-        if not is_stuck and len(self.planned_actions) > self.plan_duration:
-            self.planned_actions = []
-
-        # --- 2. ENTER RECOVERY ---
-        if is_stuck:
-            if len(self.planned_actions) <= self.plan_duration:
-                self.planned_actions = []
-                
-                best_seq = self._run_cem(obs, direction=1, recovery=True)
-
-                first_action = best_seq[0]
-                norm = np.linalg.norm(first_action)
-                if norm > 1e-6:
-                    recovery_action = (first_action / norm) * constants.MAX_ACTION_MAGNITUDE
-                else:
-                    recovery_action = np.array([constants.MAX_ACTION_MAGNITUDE, 0.0])
-                
-                self.planned_actions = [recovery_action for _ in range(200)]
-                return self.planned_actions.pop(0)
-
-        # --- 3. EXECUTE BUFFERED PLAN ---
-        if len(self.planned_actions) > 0:
-            action = self.planned_actions.pop(0)
-            return action
-
-        # --- 4. STANDARD REPLAN (CEM) ---
-        best_seq = self._run_cem(obs, direction=1, test=True)
-        self.planned_actions = list(best_seq[:self.plan_duration])
-        first_action = self.planned_actions.pop(0)
         
-        return first_action
+        # 1. Fallback Recovery (Just in case the robot hits a wall hard)
+        if self._is_stuck():
+            if self.recovery_steps <= 0:
+                print("Robot stuck during testing! Using fallback recovery action.")
+                self.recovery_steps = 10
+                angle = np.random.uniform(-np.pi/3, np.pi/3) # Push generally forward
+                self.recovery_action = np.array([
+                    constants.MAX_ACTION_MAGNITUDE * np.cos(angle), 
+                    constants.MAX_ACTION_MAGNITUDE * np.sin(angle)
+                ])
+            self.recovery_steps -= 1
+            return self.recovery_action
+        
+        self.recovery_steps = 0
+        
+        # 2. Pure Behavioural Cloning Execution
+        self.bc_model.eval()
+        with torch.no_grad():
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+            action = self.bc_model(obs_t).squeeze(0).numpy()
+            action = np.clip(action, -constants.MAX_ACTION_MAGNITUDE, constants.MAX_ACTION_MAGNITUDE)
+        
+        return action
